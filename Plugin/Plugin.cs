@@ -356,9 +356,19 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
     // alpha25: bypass only WrathCombo's action-replacement detour, not the
     // native FFXIV adjustment. The official plugin's OriginalHook calls
     // its Hook<GetActionDelegate>.Original trampoline.
-    private Func<uint, uint>? wrathNativeOriginal;
+    // WrathCombo can be reloaded independently of WPH.  A delegate captured
+    // from an old ActionReplacer is NOT a permanent native trampoline.
+    // Re-discover the active replacer every three seconds on Framework.Update
+    // (never run reflection from GetAdjustedActionId / PrepareSlotForRender).
+    private volatile Func<uint, uint>? wrathNativeOriginal;
+    private object? wrathOriginalTarget;
+    private bool wrathOriginalEverConnected;
     private string wrathOriginalStatus = "未検出";
     private long wrathOriginalLastDiscoveryTick;
+    private long wrathOriginalRebindings;
+    private long wrathOriginalDisconnects;
+    private long wrathOriginalLastRebindTick;
+    private long wrathOriginalLastSuccessTick;
     private long nativeTrampolineCalls;
     private long nativeTrampolineDifferences;
     private long nativeTrampolineFailures;
@@ -369,37 +379,94 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
 
     private void DiscoverWrathNativeOriginal()
     {
-        if (wrathNativeOriginal != null) return;
-        if (Environment.TickCount64 - wrathOriginalLastDiscoveryTick < 3000) return;
-        wrathOriginalLastDiscoveryTick = Environment.TickCount64;
+        // Do not short-circuit when a delegate is already bound.  Reloading
+        // WrathCombo creates a new ActionReplacer even if its name is unchanged.
+        var now = Environment.TickCount64;
+        if (now - wrathOriginalLastDiscoveryTick < 3000) return;
+        wrathOriginalLastDiscoveryTick = now;
         try
         {
+            object? activeReplacer = null;
+            MethodInfo? activeMethod = null;
+            bool sawAssembly = false;
+            bool sawReplacer = false;
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
                 if (asm.GetName().Name != "WrathCombo") continue;
-                var service = asm.GetType("WrathCombo.Services.Service");
-                var replacerType = asm.GetType("WrathCombo.Core.ActionReplacer");
-                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
-                var instance = service?.GetProperty("ActionReplacer", flags)?.GetValue(null)
-                    ?? service?.GetField("ActionReplacer", flags)?.GetValue(null);
-                var method = replacerType?.GetMethod("OriginalHook",
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                    null, [typeof(uint)], null);
-                if (instance == null || method == null || method.ReturnType != typeof(uint))
+                sawAssembly = true;
+                try
                 {
-                    wrathOriginalStatus = "本家OriginalHook/Service.ActionReplacerが見つからない";
-                    return;
+                    var service = asm.GetType("WrathCombo.Services.Service");
+                    var replacerType = asm.GetType("WrathCombo.Core.ActionReplacer");
+                    var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+                    var instance = service?.GetProperty("ActionReplacer", flags)?.GetValue(null)
+                        ?? service?.GetField("ActionReplacer", flags)?.GetValue(null);
+                    var method = replacerType?.GetMethod("OriginalHook",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                        null, [typeof(uint)], null);
+                    if (instance == null || method == null || method.ReturnType != typeof(uint))
+                        continue;
+                    sawReplacer = true;
+                    // Assemblies left from a prior WrathCombo reload may still
+                    // exist in this process. Skip disabled / disposed hooks.
+                    var enabledProperty = instance.GetType().GetProperty("ActionReplacingEnabled",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (enabledProperty?.GetValue(instance) is bool enabled && !enabled)
+                        continue;
+                    activeReplacer = instance;
+                    activeMethod = method;
                 }
-                // Bind once; avoid reflection invocation inside render hot path.
-                wrathNativeOriginal = (Func<uint,uint>)method.CreateDelegate(typeof(Func<uint,uint>), instance);
-                wrathOriginalStatus = "WrathCombo.OriginalHook取得OK（FF14標準トランポリン）";
+                catch
+                {
+                    // A disposed stale assembly must not block discovery of
+                    // another active instance in a newer AssemblyLoadContext.
+                    continue;
+                }
+            }
+
+            if (activeReplacer == null || activeMethod == null)
+            {
+                if (wrathNativeOriginal != null)
+                {
+                    wrathNativeOriginal = null;
+                    wrathOriginalTarget = null;
+                    Interlocked.Increment(ref wrathOriginalDisconnects);
+                    wrathOriginalLastRebindTick = now;
+                }
+                wrathOriginalStatus = !sawAssembly ? "WrathCombo未ロード" :
+                    !sawReplacer ? "本家ActionReplacer/OriginalHookが見つかりません" :
+                    "WrathComboのAction置換がOFF/再起動中（標準経路の呼出を停止）";
                 return;
             }
-            wrathOriginalStatus = "WrathComboアセンブリ未ロード";
+
+            if (wrathNativeOriginal != null && ReferenceEquals(activeReplacer, wrathOriginalTarget))
+            {
+                wrathOriginalStatus = "接続OK（現在のWrathComboインスタンスを確認）";
+                return;
+            }
+
+            // Create the replacement delegate before publishing it.  Calling
+            // code takes an atomic reference snapshot, never a reflection call.
+            var newOriginal = (Func<uint, uint>)activeMethod.CreateDelegate(
+                typeof(Func<uint, uint>), activeReplacer);
+            var isReconnection = wrathOriginalEverConnected;
+            wrathOriginalTarget = activeReplacer;
+            wrathNativeOriginal = newOriginal;
+            wrathOriginalEverConnected = true;
+            if (isReconnection) Interlocked.Increment(ref wrathOriginalRebindings);
+            wrathOriginalLastRebindTick = now;
+            wrathOriginalStatus = isReconnection
+                ? "WrathCombo再接続OK（新インスタンスを取得）"
+                : "WrathCombo OriginalHook取得OK";
         }
         catch (Exception ex)
         {
-            wrathOriginalStatus = $"取得失敗: {ex.GetType().Name}: {ex.Message}";
+            // A reflection failure must not keep calling a potentially
+            // disposed hook from an earlier WrathCombo instance.
+            if (wrathNativeOriginal != null) Interlocked.Increment(ref wrathOriginalDisconnects);
+            wrathNativeOriginal = null;
+            wrathOriginalTarget = null;
+            wrathOriginalStatus = $"接続確認失敗: {ex.GetType().Name}";
         }
     }
 
@@ -2267,11 +2334,12 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
     private uint GetNativePulseAction(uint stored)
     {
         if (stored == 0) return 0;
-        if (config.NativeTrampolineEnabled && wrathNativeOriginal != null)
+        var nativeOriginal = wrathNativeOriginal;
+        if (config.NativeTrampolineEnabled && nativeOriginal != null)
         {
             try
             {
-                var native = wrathNativeOriginal(stored);
+                var native = nativeOriginal(stored);
                 if (native != 0) return native;
             }
             catch (Exception ex)
@@ -2502,15 +2570,19 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         // FF14's original adjustment path. Never change global Wrath settings.
         // Only the exact stored action ID is eligible, so unrelated calls
         // (even on the same thread) are passed on unchanged.
+        // Snapshot the delegate once. A Framework.Update reconnect can replace
+        // it concurrently; never check one instance and call another.
+        var currentOriginal = wrathNativeOriginal;
         if ((config.IsolateUnselectedExecution || config.IsolateUnselectedTooltip) && executingPureDepth > 0 &&
             executingPureBar >= 0 && executingPureBar != config.SelectedHotbar - 1 &&
             actionId == executingPureStoredId)
         {
-            if (wrathNativeOriginal != null)
+            if (currentOriginal != null)
             {
                 try
                 {
-                    uint result = wrathNativeOriginal(actionId);
+                    uint result = currentOriginal(actionId);
+                    Volatile.Write(ref wrathOriginalLastSuccessTick, Environment.TickCount64);
                     executeIsolationLastNative = result;
                     if (config.IsolateUnselectedExecution)
                         Interlocked.Increment(ref executeIsolationScopedAdjustments);
@@ -2522,6 +2594,8 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
                 {
                     Interlocked.Increment(ref executeIsolationFailures);
                     executeIsolationStatus = $"標準経路呼出失敗: {e.GetType().Name}";
+                    // Force a new instance check on the next framework update.
+                    wrathOriginalLastDiscoveryTick = 0;
                     // Fail open to game normal action pipeline, not a synthetic action.
                 }
             }
@@ -2530,13 +2604,14 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         var inOtherBar = nativeRenderScopeDepth > 0 &&
             tracedBar >= 0 && tracedBar != config.SelectedHotbar - 1;
         uint adjusted;
-        if (config.NativeTrampolineEnabled && inOtherBar && wrathNativeOriginal != null)
+        if (config.NativeTrampolineEnabled && inOtherBar && currentOriginal != null)
         {
             // Call the trampoline exposed by WrathCombo itself. Never return
             // the raw stored ID; native game transformations are preserved.
             try
             {
-                adjusted = wrathNativeOriginal(actionId);
+                adjusted = currentOriginal(actionId);
+                Volatile.Write(ref wrathOriginalLastSuccessTick, Environment.TickCount64);
                 Interlocked.Increment(ref nativeTrampolineCalls);
                 Volatile.Write(ref lastTrampolineInput, actionId);
                 Volatile.Write(ref lastTrampolineNative, adjusted);
@@ -2544,8 +2619,10 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
             catch (Exception ex)
             {
                 Interlocked.Increment(ref nativeTrampolineFailures);
-                wrathOriginalStatus = $"実行失敗: {ex.GetType().Name}";
-                config.NativeTrampolineEnabled = false;
+                wrathOriginalStatus = $"実行失敗: {ex.GetType().Name}（再接続確認待ち）";
+                wrathOriginalLastDiscoveryTick = 0;
+                // Do not permanently change the user's configuration because
+                // a WrathCombo reload temporarily invalidated a delegate.
                 adjusted = adjustedActionHook!.Original(self, actionId);
             }
         }
@@ -4791,6 +4868,24 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
             if (!string.IsNullOrEmpty(fastHookRecoveryStatus)) ImGui.TextWrapped(fastHookRecoveryStatus);
             ImGui.TextDisabled($"純正表示の切り分け: {(nativeRenderHooksActive ? "有効" : "準備中")}");
             ImGui.TextDisabled($"スキル説明の補正: {tooltipIsolationStatus}");
+            if (ImGui.TreeNode("WrathCombo連携の診断 (HB分離)"))
+            {
+                ImGui.Text($"WrathCombo参照: {wrathOriginalStatus}");
+                ImGui.Text($"選択したWrathCombo用HB: {config.SelectedHotbar}");
+                ImGui.Text($"ネイティブ描画フック: {(nativeRenderHooksActive ? "ON" : "OFF")}");
+                ImGui.Text($"ActionIdフック: {(adjustedActionHook?.IsEnabled == true ? "ON" : "OFF")}");
+                ImGui.Text($"通常HBの実行分離: {executeIsolationStatus}");
+                ImGui.Text($"Wrath再接続回数: {Interlocked.Read(ref wrathOriginalRebindings)} / 切断検出: {Interlocked.Read(ref wrathOriginalDisconnects)}");
+                if (wrathOriginalLastRebindTick > 0)
+                    ImGui.TextDisabled($"接続状態の最終変化: {Math.Max(0, (Environment.TickCount64 - wrathOriginalLastRebindTick) / 1000)}秒前");
+                ImGui.Text($"描画中の標準経路呼出: {Interlocked.Read(ref nativeTrampolineCalls)} / 未接続: {Interlocked.Read(ref nativeTrampolineMisses)} / 例外: {Interlocked.Read(ref nativeTrampolineFailures)}");
+                ImGui.Text($"通常HB実行要求: {Interlocked.Read(ref executeIsolationCalls)} / 分離経路: {Interlocked.Read(ref executeIsolationScopedAdjustments)} / 未接続: {Interlocked.Read(ref executeIsolationScopeMisses)} / 例外: {Interlocked.Read(ref executeIsolationFailures)}");
+                var lastSuccess = Volatile.Read(ref wrathOriginalLastSuccessTick);
+                ImGui.TextDisabled($"標準経路の最終呼出: {(lastSuccess > 0 ? $"{Math.Max(0, (Environment.TickCount64 - lastSuccess) / 1000)}秒前" : "未観測")}");
+                ImGui.TextWrapped("これらは経路の呼出状況であり、対象外HBの見た目や実行結果が完全に分離された証明ではありません。フック順序の変化は自動修復できない場合があります。");
+                ImGui.TextWrapped("HB3の置き換えが続く場合は、ログインし直して再現するか、WrathComboを再読み込みした直後かを併せて確認してください。");
+                ImGui.TreePop();
+            }
         }
 
 
