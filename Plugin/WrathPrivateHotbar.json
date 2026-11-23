@@ -1,4 +1,4 @@
-﻿{
+{
   "Author": "WrathPrivateHotbar",
   "Name": "WrathPrivateHotbar",
   "InternalName": "WrathPrivateHotbar",
@@ -10,8 +10,8 @@
     "WrathCombo",
     "Japanese"
   ],
-  "AssemblyVersion": "2.0.5.101",
+  "AssemblyVersion": "2.0.5.105",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
-  "Changelog": "v2.0.5.101: WrathCombo再読み込み時に古いOriginalHook参照を維持し続けないよう、現在のActionReplacerの再検出と再接続を追加。接続・切断回数、標準経路の呼出・ミス・例外を設定6に表示。フック順序の完全復旧は保証しません。v2.0.5.100の未登録チェッカー等は維持。"
+  "Changelog": "v2.0.5.105: v102で停止していた長押し中の繰り返し発光を復旧。内蔵Turbo・外部連打プラグイン併用時のキー保持を表示し、キー解放・文字入力中は停止。FF14実機は未検証。"
 }

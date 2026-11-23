@@ -42,6 +42,8 @@ public sealed class PluginConfig : IPluginConfiguration
     // be unsafe after game or Dalamud updates; preserve crash recovery.
     public bool InstantNativeHookStartup { get; set; } = true;
     public bool NativeTrampolineEnabled { get; set; } = true;
+    // v103: use FFXIV per-frame appearance path to isolate normal HB icons.
+    public bool NativeAppearanceIsolationEnabled { get; set; } = true;
 // Keep non-selected hotbar executions native to the game.
     public bool IsolateUnselectedExecution { get; set; } = true;
 // Keep non-selected hotbar tooltips native to the game.
@@ -77,6 +79,8 @@ public sealed class PluginConfig : IPluginConfiguration
     public int BuiltInTurboIntervalMs { get; set; } = 100;
     public int BuiltInTurboStartDelayMs { get; set; } = 0;
     public bool BuiltInTurboOutOfCombat { get; set; } = true;
+    // Visual-only held-key repeat cadence (restored in v105).
+    // Independent of BuiltInTurbo and external plugins' action request timings.
     public bool RandomPulse { get; set; } = true;
     public int PulseMinMs { get; set; } = 80;
     public int PulseMaxMs { get; set; } = 300;

@@ -139,7 +139,7 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
     {
         bool shouldEnable = config.IsolateUnselectedExecution &&
                             Volatile.Read(ref nativeObservationArmed) != 0 &&
-                            adjustedActionHook != null && nativeRenderHooksActive &&
+                            adjustedActionHook?.IsEnabled == true && nativeRenderHooksActive &&
                             wrathNativeOriginal != null;
         if (!shouldEnable)
         {
@@ -262,7 +262,7 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
     {
         bool ready = config.IsolateUnselectedTooltip &&
                      Volatile.Read(ref nativeObservationArmed) != 0 &&
-                     clientState.IsLoggedIn && adjustedActionHook != null &&
+                     clientState.IsLoggedIn && adjustedActionHook?.IsEnabled == true &&
                      nativeRenderHooksActive && wrathNativeOriginal != null;
         if (!ready)
         {
@@ -333,6 +333,27 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         RaptureHotbarModule.HotbarSlot* slot,
         RaptureHotbarModule.HotbarUIIntermediate* intermediate);
     private Hook<PrepareSlotDelegate>? iconRenderHook;
+    // v103: the per-frame appearance path runs separately from PrepareSlotForRender.
+    // Keep this distinct so a hook installation failure cannot disable existing routes.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint GetSlotAppearanceDelegate(
+        RaptureHotbarModule.HotbarSlotType* actionType, uint* actionId,
+        ushort* unkC4, RaptureHotbarModule* module, RaptureHotbarModule.HotbarSlot* slot);
+    private Hook<GetSlotAppearanceDelegate>? slotAppearanceHook;
+    private string appearanceHookStatus = "未初期化";
+    private long appearanceCalls;
+    private long appearanceMatched;
+    private long appearanceUnmatched;
+    private long appearanceScopedCalls;
+    private long appearanceAdjustedCalls;
+    private long appearanceNativeBypasses;
+    private long appearanceHookFailures;
+    private readonly long[] appearanceBarCalls = new long[10];
+    private long renderEntryCalls;
+    [ThreadStatic] private static int appearanceScopeDepth;
+    // Immutable after publishing: detour readers never mutate the snapshot.
+    private Dictionary<nint, (int Bar, int Slot)> hotbarPointerIndex = new();
+    private long lastHotbarPointerIndexTick;
     // EXPERIMENT: limit adjusted-action suppression to a native hotbar render
     // call on the current thread. No WrathCombo file or global config changes.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -822,52 +843,87 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
             Array.Clear(nativeMirrorSlots);
             nativeMirrorFreshSlots = 0;
         }
-        if (!nativeRenderHooksActive) return;
         nativeRenderHooksActive = false;
-        try { adjustedActionHook?.Disable(); } catch (Exception ex) { log.Warning($"Native adjusted detour suspend: {ex.Message}"); }
-        try { iconRenderHook?.Disable(); } catch (Exception ex) { log.Warning($"Native render detour suspend: {ex.Message}"); }
-        RecordStartupPhase("native render hooks suspended");
+        // Each hook can now attach independently. Suspend all of them even if
+        // PrepareSlotForRender was the one hook that failed to attach.
+        try { if (adjustedActionHook?.IsEnabled == true) adjustedActionHook.Disable(); } catch (Exception ex) { log.Warning($"Native adjusted detour suspend: {ex.Message}"); }
+        try { if (iconRenderHook?.IsEnabled == true) iconRenderHook.Disable(); } catch (Exception ex) { log.Warning($"Native render detour suspend: {ex.Message}"); }
+        try { if (slotAppearanceHook?.IsEnabled == true) slotAppearanceHook.Disable(); } catch (Exception ex) { log.Warning($"Appearance detour suspend: {ex.Message}"); }
+        if (wasArmed) RecordStartupPhase("native render hooks suspended");
     }
 
     private void EnableNativeRenderHooksAfterLogin()
     {
-        if (nativeRenderHooksActive) return;
+        // v104: a successful render hook must not block retrying another hook.
+        var needsRender = iconRenderHook?.IsEnabled != true;
+        var needsAdjusted = adjustedActionHook?.IsEnabled != true;
+        var needsAppearance = slotAppearanceHook?.IsEnabled != true;
+        if (!needsRender && !needsAdjusted && !needsAppearance) return;
         var now = Environment.TickCount64;
         if (now - lastHookInstallAttemptTick < 5000) return;
         lastHookInstallAttemptTick = now;
-        // Do not allow the callbacks to read native HUD data while installing.
-        Volatile.Write(ref nativeObservationArmed, 0);
+        // Keep native callbacks disarmed only while attaching missing routes.
+        var previousArmed = Interlocked.Exchange(ref nativeObservationArmed, 0);
         RecordStartupPhase("attaching native render hooks after stable login");
         try
         {
-            iconRenderHook ??= gameInterop.HookFromAddress<PrepareSlotDelegate>(
-                (nint)RaptureHotbarModule.MemberFunctionPointers.PrepareSlotForRender,
-                OnPrepareSlotForRender);
-            iconRenderHook.Enable();
-            nativeRenderHooksActive = true;
-            nativeRestoreStatus = "純正描画フック有効（ログイン安定後）";
+            if (needsRender)
+            {
+                try
+                {
+                    iconRenderHook ??= gameInterop.HookFromAddress<PrepareSlotDelegate>(
+                        (nint)RaptureHotbarModule.MemberFunctionPointers.PrepareSlotForRender,
+                        OnPrepareSlotForRender);
+                    iconRenderHook.Enable();
+                    nativeRestoreStatus = "純正描画フック有効（ログイン安定後）";
+                }
+                catch (Exception ex)
+                {
+                    nativeRestoreStatus = $"純正描画フック利用不可: {ex.GetType().Name}";
+                    log.Warning($"Delayed native render hook unavailable: {ex.Message}");
+                }
+            }
+            // This flag describes only the PrepareSlotForRender hook.
+            nativeRenderHooksActive = iconRenderHook?.IsEnabled == true;
+            if (needsAdjusted)
+            {
+                try
+                {
+                    adjustedActionHook ??= gameInterop.HookFromAddress<GetAdjustedActionDelegate>(
+                        (nint)ActionManager.MemberFunctionPointers.GetAdjustedActionId,
+                        OnGetAdjustedActionId);
+                    adjustedActionHook.Enable();
+                    scopedRenderStatus = "スコープ付きActionIdフック有効（ログイン安定後）";
+                }
+                catch (Exception ex)
+                {
+                    scopedRenderStatus = $"ActionIdフック利用不可: {ex.GetType().Name}";
+                    log.Warning($"Delayed native adjusted hook unavailable: {ex.Message}");
+                }
+            }
+            if (needsAppearance)
+            {
+                try
+                {
+                    slotAppearanceHook ??= gameInterop.HookFromAddress<GetSlotAppearanceDelegate>(
+                        (nint)RaptureHotbarModule.MemberFunctionPointers.GetSlotAppearance,
+                        OnGetSlotAppearance);
+                    slotAppearanceHook.Enable();
+                    appearanceHookStatus = "GetSlotAppearanceフック有効";
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.Increment(ref appearanceHookFailures);
+                    appearanceHookStatus = $"GetSlotAppearanceフック利用不可: {ex.GetType().Name}";
+                    log.Warning($"Appearance hook unavailable: {ex.Message}");
+                }
+            }
+            RecordStartupPhase("native hook attach attempts completed");
         }
-        catch (Exception ex)
+        finally
         {
-            nativeRestoreStatus = $"純正描画フック利用不可: {ex.GetType().Name}";
-            log.Warning($"Delayed native render hook unavailable: {ex.Message}");
-            RecordStartupPhase("native render hook installation failed");
-            return;
+            Volatile.Write(ref nativeObservationArmed, previousArmed);
         }
-        try
-        {
-            adjustedActionHook ??= gameInterop.HookFromAddress<GetAdjustedActionDelegate>(
-                (nint)ActionManager.MemberFunctionPointers.GetAdjustedActionId,
-                OnGetAdjustedActionId);
-            adjustedActionHook.Enable();
-            scopedRenderStatus = "スコープ付きActionIdフック有効（ログイン安定後）";
-        }
-        catch (Exception ex)
-        {
-            scopedRenderStatus = $"ActionIdフック利用不可: {ex.GetType().Name}";
-            log.Warning($"Delayed native adjusted hook unavailable: {ex.Message}");
-        }
-        RecordStartupPhase("native hooks attached after safe delay");
     }
 
     // Independent fast path: render and click once the ordinary RaptureHotbar
@@ -1278,7 +1334,6 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
                    $"最短 {probe.Minimum:F1} ms / 最長 {probe.Maximum:F1} ms / 直近 {probe.Count} 区間");
     }
 
-    private long nextPulseAt;
     private readonly bool[] previousKeyDown = new bool[12];
     // Only key presses that began WITHOUT Shift/Ctrl/Alt may become plain-key
     // pulse sources. Preserve eligibility for keys already held when Shift is
@@ -1287,6 +1342,7 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
     private readonly long[] pulseUnmodifiedPressTicks = new long[12];
     private int activePulseSource = -1;
     private long lastPulseKeyPressAt;
+    private long nextNativePulseAt;
     private int pulseCount;
     private string pulseStatus = "未実行";
     // Optional original FF14 UI-sound synchronization while holding a hotbar key.
@@ -1763,6 +1819,7 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         UpdateScreenEventVisibility(uiReady);
         UpdateKeyboundMatchVisibility();
         UpdateSkillAuditMonitor(uiReady);
+        UpdateHotbarPointerIndex();
         if (hudReady) RefreshNativeInternalHotbarSize();
         ProcessOverlayClick(uiReady);
         // Native proc transitions need frame-rate updates after HUD settles.
@@ -1777,7 +1834,8 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         // Hiding only needs normal HUD readiness, not the later native detours.
         // This ensures the chosen hotbar disappears promptly after login.
         if (uiReady) MaintainHiddenHotbars();
-        if (hudReady && (config.NativeTrampolineEnabled || config.IsolateUnselectedExecution || config.IsolateUnselectedTooltip))
+        if (hudReady && (config.NativeTrampolineEnabled || config.NativeAppearanceIsolationEnabled ||
+                         config.IsolateUnselectedExecution || config.IsolateUnselectedTooltip))
             DiscoverWrathNativeOriginal();
         UpdateExecuteIsolationHooks();
         UpdateTooltipIsolationHook();
@@ -1949,17 +2007,48 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
     // Native action-bar pulse, adapted from the preserved v1.1.9 companion.
     // This alpha supports the standard unmodified 1..0,-,= keyboard layout.
     // It does not issue actions or change WrathCombo's execution behavior.
+    private void ResetNativePulseState()
+    {
+        Volatile.Write(ref audioHeldKey, 0);
+        activePulseSource = -1;
+        nextNativePulseAt = 0;
+        visualPulseIntervals.RestartSequence();
+        Array.Clear(previousKeyDown);
+        Array.Clear(pulseKeyEligible);
+        Array.Clear(pulseUnmodifiedPressTicks);
+    }
+
+    private int GetNativePulseIntervalMs()
+    {
+        if (!config.RandomPulse) return Math.Clamp(config.FixedPulseMs, 50, 1000);
+        var first = Math.Clamp(config.PulseMinMs, 50, 1000);
+        var second = Math.Clamp(config.PulseMaxMs, 50, 1000);
+        return Random.Shared.Next(Math.Min(first, second), Math.Max(first, second) + 1);
+    }
+
     private void UpdateNativePulses()
     {
-        if (!config.PulseEnabled || Volatile.Read(ref earlyHotbarReady) == 0 || !IsGameForeground())
+        if (!config.PulseEnabled || !clientState.IsLoggedIn ||
+            Volatile.Read(ref earlyHotbarReady) == 0 || !IsGameForeground() ||
+            Volatile.Read(ref hideForScreenEvent) != 0)
         {
-            Volatile.Write(ref audioHeldKey, 0);
-            activePulseSource = -1;
-            nextPulseAt = 0;
-            visualPulseIntervals.RestartSequence();
-            Array.Clear(previousKeyDown);
-            Array.Clear(pulseKeyEligible);
-            Array.Clear(pulseUnmodifiedPressTicks);
+            ResetNativePulseState();
+            return;
+        }
+        // Do not animate hotbar keys while they are being used to type text.
+        try
+        {
+            var stage = AtkStage.Instance();
+            if ((stage != null && stage->AtkInputManager != null &&
+                 stage->AtkInputManager->IsTextInputActive) || ImGui.GetIO().WantTextInput)
+            {
+                ResetNativePulseState();
+                return;
+            }
+        }
+        catch
+        {
+            ResetNativePulseState();
             return;
         }
 
@@ -1967,12 +2056,7 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         if (lastPulseBar != config.SelectedHotbar)
         {
             lastPulseBar = config.SelectedHotbar;
-            activePulseSource = -1;
-            nextPulseAt = 0;
-            visualPulseIntervals.RestartSequence();
-            Array.Clear(previousKeyDown);
-            Array.Clear(pulseKeyEligible);
-            Array.Clear(pulseUnmodifiedPressTicks);
+            ResetNativePulseState();
         }
         // Key polling is based on Windows VK, not FF14's actual hotbar bindings.
         // Shift+minus (e.g. Swiftcast on bar 3) must NOT trigger plain minus
@@ -1993,12 +2077,12 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         if (modifierHeld)
         {
             Volatile.Write(ref audioHeldKey, 0);
+            nextNativePulseAt = 0;
             // Stop emitting while a modifier is held, but keep any plain-key
             // hold that began before the modifier (e.g. the user's held 1).
             // Newly pressed modified keys are NEVER promoted to a plain-key
             // pulse when Shift/Ctrl/Alt is subsequently released.
             activePulseSource = -1;
-            nextPulseAt = 0;
             for (var i = 0; i < 12; i++)
             {
                 var down = keyCodes[i] != 0 && (GetAsyncKeyState(keyCodes[i]) & 0x8000) != 0;
@@ -2010,6 +2094,10 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
             return;
         }
 
+        // v105: restore held-key feedback for both built-in Turbo and external
+        // repeat plugins. A new press pulses immediately; a still-held source
+        // pulses at the configured visual interval. Never dispatch an action.
+        var newPulseKey = -1;
         // Edge detection still gives a newly pressed key priority. However,
         // when that key is released, reacquire the most recently pressed
         // eligible key that is STILL DOWN, without requiring a key re-press.
@@ -2025,9 +2113,9 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
                 pulseKeyEligible[i] = true;
                 pulseUnmodifiedPressTicks[i] = keyTick;
                 activePulseSource = i;
+                newPulseKey = i;
                 lastPulseKeyPressAt = keyTick;
                 visualPulseIntervals.RestartSequence();
-                nextPulseAt = 0;
             }
             previousKeyDown[i] = down;
         }
@@ -2050,8 +2138,8 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
             {
                 activePulseSource = fallback;
                 lastPulseKeyPressAt = keyTick;
+                nextNativePulseAt = 0;
                 visualPulseIntervals.RestartSequence();
-                nextPulseAt = 0;
             }
             else if (activePulseSource < 0 || keyTick - lastPulseKeyPressAt > 340)
             {
@@ -2059,6 +2147,7 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
                 // there is NO longer-held eligible source to resume.
                 Volatile.Write(ref audioHeldKey, 0);
                 activePulseSource = -1;
+                nextNativePulseAt = 0;
                 return;
             }
         }
@@ -2069,16 +2158,20 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
             previousKeyDown[activePulseSource] && pulseKeyEligible[activePulseSource];
         Volatile.Write(ref audioHeldKey, physicallyHeld ? 1 : 0);
 
-        var now = Environment.TickCount64;
-        if (now < nextPulseAt) return;
-        var delay = config.RandomPulse
-            ? Random.Shared.Next(Math.Max(50, config.PulseMinMs), Math.Max(51, config.PulseMaxMs + 1))
-            : Math.Max(50, config.FixedPulseMs);
-        nextPulseAt = now + delay;
+        // The release grace retains no repeat or sound. Schedule from NOW,
+        // never catch up with a burst of pulses after a delayed frame.
+        if (!physicallyHeld)
+        {
+            nextNativePulseAt = 0;
+            return;
+        }
+        if (newPulseKey < 0 && keyTick < nextNativePulseAt) return;
+        nextNativePulseAt = keyTick + GetNativePulseIntervalMs();
+        var pulseSlot = activePulseSource;
         try
         {
             var sourceModule = RaptureHotbarModule.Instance();
-            var source = sourceModule == null ? null : sourceModule->GetSlotById((uint)(config.SelectedHotbar - 1), (uint)activePulseSource);
+            var source = sourceModule == null ? null : sourceModule->GetSlotById((uint)(config.SelectedHotbar - 1), (uint)pulseSlot);
             if (source == null || source->CommandId == 0) return;
             // Record the observable pulse before matching slots. This gives the
             // player keypress feedback even when no secondary hotbar slot matches.
@@ -2089,10 +2182,10 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
             // The overlay snapshot is only refreshed every 250ms. During an RDM
             // melee chain it can lag one step behind the actual replacement.
             // Read the live Wrath-adjusted action at the moment of each pulse.
-            uint action = ResolveRequestedPulseAction(source, activePulseSource);
+            uint action = ResolveRequestedPulseAction(source, pulseSlot);
             var matched = PulseMatchingOtherHotbars(source->CommandType, source->CommandId, action);
             pulseCount += matched;
-            pulseStatus = $"発光 {matched} 枠 / 累計 {pulseCount} / キー {activePulseSource + 1} / 登録ID {source->CommandId} / 現在ID {action}";
+            pulseStatus = $"発光 {matched} 枠 / 累計 {pulseCount} / キー {pulseSlot + 1} / 登録ID {source->CommandId} / 現在ID {action}";
         }
         catch (Exception ex) { pulseStatus = $"発光失敗: {ex.GetType().Name}"; }
     }
@@ -2564,6 +2657,8 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
     // IMPORTANT: hook order may still permit WrathCombo to replace Jolt.
     private uint OnGetAdjustedActionId(ActionManager* self, uint actionId)
     {
+        if (appearanceScopeDepth > 0)
+            Interlocked.Increment(ref appearanceAdjustedCalls);
         if (Volatile.Read(ref nativeObservationArmed) == 0)
             return adjustedActionHook!.Original(self, actionId);
         // alpha51: during a verified HB2..10 native slot execution, prefer
@@ -2603,8 +2698,13 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         }
         var inOtherBar = nativeRenderScopeDepth > 0 &&
             tracedBar >= 0 && tracedBar != config.SelectedHotbar - 1;
+        // The new, visible appearance switch is sufficient for its own route.
+        // Legacy configurations can have NativeTrampolineEnabled=false; that
+        // must not silently disable an appearance feature shown as ON.
+        var useNativeRender = config.NativeTrampolineEnabled ||
+            (config.NativeAppearanceIsolationEnabled && appearanceScopeDepth > 0);
         uint adjusted;
-        if (config.NativeTrampolineEnabled && inOtherBar && currentOriginal != null)
+        if (useNativeRender && inOtherBar && currentOriginal != null)
         {
             // Call the trampoline exposed by WrathCombo itself. Never return
             // the raw stored ID; native game transformations are preserved.
@@ -2613,6 +2713,8 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
                 adjusted = currentOriginal(actionId);
                 Volatile.Write(ref wrathOriginalLastSuccessTick, Environment.TickCount64);
                 Interlocked.Increment(ref nativeTrampolineCalls);
+                if (appearanceScopeDepth > 0)
+                    Interlocked.Increment(ref appearanceNativeBypasses);
                 Volatile.Write(ref lastTrampolineInput, actionId);
                 Volatile.Write(ref lastTrampolineNative, adjusted);
             }
@@ -2628,7 +2730,7 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         }
         else
         {
-            if (config.NativeTrampolineEnabled && inOtherBar)
+            if (useNativeRender && inOtherBar)
                 Interlocked.Increment(ref nativeTrampolineMisses);
             adjusted = adjustedActionHook!.Original(self, actionId);
         }
@@ -2665,10 +2767,91 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         return adjusted;
     }
 
+    // Build a new snapshot only on the framework thread (once a second). This
+    // avoids doing up to 120 native GetSlotById calls for EACH visible slot and
+    // avoids touching live native pointer collections inside appearance detours.
+    private void UpdateHotbarPointerIndex()
+    {
+        var now = Environment.TickCount64;
+        if (now - lastHotbarPointerIndexTick < 1000) return;
+        lastHotbarPointerIndexTick = now;
+        if (Volatile.Read(ref nativeObservationArmed) == 0 || !clientState.IsLoggedIn)
+        {
+            Volatile.Write(ref hotbarPointerIndex, new Dictionary<nint, (int, int)>());
+            return;
+        }
+        try
+        {
+            var module = RaptureHotbarModule.Instance();
+            if (module == null || !module->ModuleReady) return;
+            var fresh = new Dictionary<nint, (int Bar, int Slot)>(120);
+            for (var bar = 0; bar < 10; bar++)
+            for (var index = 0; index < 12; index++)
+            {
+                var slot = module->GetSlotById((uint)bar, (uint)index);
+                if (slot != null) fresh[(nint)slot] = (bar, index);
+            }
+            Volatile.Write(ref hotbarPointerIndex, fresh);
+        }
+        catch (Exception ex)
+        {
+            appearanceHookStatus = $"HB索引の更新失敗: {ex.GetType().Name}";
+        }
+    }
+
+    // The game uses this routine to resolve each visible slot's action appearance
+    // on a repeated render path. Do not edit the slot, actionId*, or actionType*.
+    // Just make the ORIGINAL native GetAdjustedActionId available to other bars.
+    private uint OnGetSlotAppearance(RaptureHotbarModule.HotbarSlotType* actionType,
+        uint* actionId, ushort* unkC4, RaptureHotbarModule* module,
+        RaptureHotbarModule.HotbarSlot* slot)
+    {
+        Interlocked.Increment(ref appearanceCalls);
+        if (Volatile.Read(ref nativeObservationArmed) == 0 ||
+            !clientState.IsLoggedIn || module == null || slot == null ||
+            slot->CommandType != RaptureHotbarModule.HotbarSlotType.Action)
+            return slotAppearanceHook!.Original(actionType, actionId, unkC4, module, slot);
+
+        if (!Volatile.Read(ref hotbarPointerIndex).TryGetValue((nint)slot, out var identified))
+        {
+            Interlocked.Increment(ref appearanceUnmatched);
+            return slotAppearanceHook!.Original(actionType, actionId, unkC4, module, slot);
+        }
+        Interlocked.Increment(ref appearanceMatched);
+        Interlocked.Increment(ref appearanceBarCalls[identified.Bar]);
+        if (!config.NativeAppearanceIsolationEnabled ||
+            identified.Bar == config.SelectedHotbar - 1 ||
+            adjustedActionHook?.IsEnabled != true)
+            return slotAppearanceHook!.Original(actionType, actionId, unkC4, module, slot);
+
+        Interlocked.Increment(ref appearanceScopedCalls);
+        var priorBar = tracedBar;
+        var priorSlot = tracedSlot;
+        var priorDepth = tracedDepth;
+        nativeRenderScopeDepth++;
+        appearanceScopeDepth++;
+        tracedBar = identified.Bar;
+        tracedSlot = identified.Slot;
+        tracedDepth++;
+        try
+        {
+            return slotAppearanceHook!.Original(actionType, actionId, unkC4, module, slot);
+        }
+        finally
+        {
+            tracedDepth = priorDepth;
+            tracedBar = priorBar;
+            tracedSlot = priorSlot;
+            appearanceScopeDepth--;
+            nativeRenderScopeDepth--;
+        }
+    }
+
     private void OnPrepareSlotForRender(RaptureHotbarModule* module,
         RaptureHotbarModule.HotbarSlot* slot,
         RaptureHotbarModule.HotbarUIIntermediate* intermediate)
     {
+        Interlocked.Increment(ref renderEntryCalls);
         // During login / UI recreation forward directly to the native render
         // chain. No slot dereference, addon lookup, or UI intermediate reads.
         if (Volatile.Read(ref nativeObservationArmed) == 0 ||
@@ -2686,22 +2869,15 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         var traceBar = -1;
         var traceIndex = -1;
         if ((config.ScopedNativeRenderEnabled || config.RenderChainTraceEnabled || config.WrathScopedGateEnabled || config.NativeTrampolineEnabled) &&
-            adjustedActionHook != null && slot != null &&
-            slot->CommandType == RaptureHotbarModule.HotbarSlotType.Action)
+            adjustedActionHook?.IsEnabled == true && slot != null &&
+            slot->CommandType == RaptureHotbarModule.HotbarSlotType.Action &&
+            Volatile.Read(ref hotbarPointerIndex).TryGetValue((nint)slot, out var identified))
         {
-            var liveModule = RaptureHotbarModule.Instance();
-            if (liveModule != null)
-                for (var hb = 0; hb < 10 && traceBar < 0; hb++)
-                    for (var si = 0; si < 12; si++)
-                        if (liveModule->GetSlotById((uint)hb, (uint)si) == slot)
-                        {
-                            traceBar = hb;
-                            traceIndex = si;
-                            break;
-                        }
-            scoped = traceBar >= 0 && traceBar != config.SelectedHotbar - 1 &&
+            traceBar = identified.Bar;
+            traceIndex = identified.Slot;
+            scoped = traceBar != config.SelectedHotbar - 1 &&
                      (config.ScopedNativeRenderEnabled || config.NativeTrampolineEnabled);
-            traceThis = traceBar >= 0 && (config.RenderChainTraceEnabled || config.NativeTrampolineEnabled);
+            traceThis = config.RenderChainTraceEnabled || config.NativeTrampolineEnabled;
         }
         if (scoped) nativeRenderScopeDepth++;
         var oldBar = tracedBar;
@@ -4781,35 +4957,38 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
             ImGui.TextWrapped("ReActionがロードされていると自動停止します。両方の連打機能は併用しません。チャット入力中・NPC会話中・非アクティブ時にも停止します。");
 
 
-            if (ImGui.CollapsingHeader("発光間隔の詳細設定"))
+            ImGui.Text("長押し中の発光");
+            ImGui.TextWrapped("キーを押した瞬間と、押しっぱなしの間に繰り返し発光します。内蔵Turbo・ReActionなどの連打機能と一緒に使えます。キーを離すと繰り返し発光は止まります。");
+            ImGui.TextDisabled("発光間隔は表示用です。スキルの連打間隔・発動成功回数とは別です。");
+            var randomPulse = config.RandomPulse;
+            if (ImGui.Checkbox("発光間隔をランダムにする", ref randomPulse))
             {
-                bool random = config.RandomPulse;
-                if (ImGui.RadioButton("ランダム間隔", random)) { config.RandomPulse = true; Save(); }
-                ImGui.SameLine();
-                if (ImGui.RadioButton("一定間隔", !random)) { config.RandomPulse = false; Save(); }
-                if (config.RandomPulse)
+                config.RandomPulse = randomPulse;
+                nextNativePulseAt = 0;
+                Save();
+            }
+            if (config.RandomPulse)
+            {
+                var minPulse = config.PulseMinMs;
+                var maxPulse = config.PulseMaxMs;
+                bool changedPulse = ImGui.SliderInt("発光の最短間隔 (ms)", ref minPulse, 50, 1000);
+                changedPulse |= ImGui.SliderInt("発光の最長間隔 (ms)", ref maxPulse, 50, 1000);
+                if (changedPulse)
                 {
-                    int min = config.PulseMinMs;
-                    int max = config.PulseMaxMs;
-                    if (ImGui.SliderInt("最短間隔 (ms)", ref min, 50, 500))
-                    {
-                        config.PulseMinMs = Math.Min(min, config.PulseMaxMs);
-                        Save();
-                    }
-                    if (ImGui.SliderInt("最長間隔 (ms)", ref max, 50, 500))
-                    {
-                        config.PulseMaxMs = Math.Max(max, config.PulseMinMs);
-                        Save();
-                    }
+                    config.PulseMinMs = Math.Min(minPulse, maxPulse);
+                    config.PulseMaxMs = Math.Max(minPulse, maxPulse);
+                    nextNativePulseAt = 0;
+                    Save();
                 }
-                else
+            }
+            else
+            {
+                var fixedPulse = config.FixedPulseMs;
+                if (ImGui.SliderInt("発光間隔 (ms)", ref fixedPulse, 50, 1000))
                 {
-                    int fixedMs = config.FixedPulseMs;
-                    if (ImGui.SliderInt("間隔 (ms)", ref fixedMs, 50, 500))
-                    {
-                        config.FixedPulseMs = fixedMs;
-                        Save();
-                    }
+                    config.FixedPulseMs = fixedPulse;
+                    nextNativePulseAt = 0;
+                    Save();
                 }
             }
 
@@ -4878,6 +5057,51 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
                 ImGui.Text($"Wrath再接続回数: {Interlocked.Read(ref wrathOriginalRebindings)} / 切断検出: {Interlocked.Read(ref wrathOriginalDisconnects)}");
                 if (wrathOriginalLastRebindTick > 0)
                     ImGui.TextDisabled($"接続状態の最終変化: {Math.Max(0, (Environment.TickCount64 - wrathOriginalLastRebindTick) / 1000)}秒前");
+                ImGui.Separator();
+                ImGui.Text("表示経路の切り分け（v104）");
+                ImGui.Text($"表示分離の設定: 新経路 {(config.NativeAppearanceIsolationEnabled ? "ON" : "OFF")} / 従来経路 {(config.NativeTrampolineEnabled ? "ON" : "OFF")}");
+                ImGui.Text($"旧描画フック呼出: {Interlocked.Read(ref renderEntryCalls)} / 処理完了: {Interlocked.Read(ref renderCalls)} / 対象外スコープ: {Interlocked.Read(ref scopedRenderCalls)}");
+                long[] observedByBar = new long[10];
+                for (var b = 0; b < 10; b++)
+                    for (var i = 0; i < 12; i++)
+                        observedByBar[b] += Interlocked.Read(ref observedRenderCount[b, i]);
+                ImGui.TextWrapped("旧描画のHB別観測: " + string.Join(" / ",
+                    observedByBar.Select((count, bar) => $"{bar+1}:{count}")));
+                ImGui.Text($"毎フレーム表示経路フック: {(slotAppearanceHook?.IsEnabled == true ? "ON" : "OFF")} / {appearanceHookStatus}");
+                ImGui.TextDisabled($"表示経路フックの初期化失敗（起動後累計）: {Interlocked.Read(ref appearanceHookFailures)} / 失敗した経路は約5秒ごとに再試行");
+                ImGui.Text($"表示経路呼出: {Interlocked.Read(ref appearanceCalls)} / HB特定成功: {Interlocked.Read(ref appearanceMatched)} / 失敗: {Interlocked.Read(ref appearanceUnmatched)}");
+                ImGui.Text($"表示経路の対象外スコープ: {Interlocked.Read(ref appearanceScopedCalls)} / スコープ中ActionId呼出: {Interlocked.Read(ref appearanceAdjustedCalls)} / 純正経路の利用: {Interlocked.Read(ref appearanceNativeBypasses)}");
+                ImGui.TextWrapped("新描画のHB別観測: " + string.Join(" / ",
+                    Enumerable.Range(0,10).Select(bar => $"{bar+1}:{Interlocked.Read(ref appearanceBarCalls[bar])}")));
+                var appearanceIsolation = config.NativeAppearanceIsolationEnabled;
+                if (ImGui.Checkbox("新しい表示分離を有効にする（テスト）", ref appearanceIsolation))
+                {
+                    config.NativeAppearanceIsolationEnabled = appearanceIsolation;
+                    Save();
+                }
+                ImGui.TextWrapped("この項目は表示用GetSlotAppearance内で対象外HBだけFF14標準のActionId変換を使用する試験機能です。問題があればOFFにしてください。実際のスキル発動経路には影響しません。");
+                if (ImGui.Button("表示診断カウンターをリセット"))
+                {
+                    Interlocked.Exchange(ref renderEntryCalls, 0);
+                    Interlocked.Exchange(ref renderCalls, 0);
+                    Interlocked.Exchange(ref scopedRenderCalls, 0);
+                    Interlocked.Exchange(ref appearanceCalls, 0);
+                    Interlocked.Exchange(ref appearanceMatched, 0);
+                    Interlocked.Exchange(ref appearanceUnmatched, 0);
+                    Interlocked.Exchange(ref appearanceScopedCalls, 0);
+                    Interlocked.Exchange(ref appearanceAdjustedCalls, 0);
+                    Interlocked.Exchange(ref appearanceNativeBypasses, 0);
+                    Interlocked.Exchange(ref nativeTrampolineCalls, 0);
+                    Interlocked.Exchange(ref nativeTrampolineMisses, 0);
+                    Interlocked.Exchange(ref nativeTrampolineFailures, 0);
+                    for (var b = 0; b < 10; b++)
+                    {
+                        Interlocked.Exchange(ref appearanceBarCalls[b], 0);
+                        for (var i = 0; i < 12; i++)
+                            Interlocked.Exchange(ref observedRenderCount[b,i], 0);
+                    }
+                }
+                ImGui.Separator();
                 ImGui.Text($"描画中の標準経路呼出: {Interlocked.Read(ref nativeTrampolineCalls)} / 未接続: {Interlocked.Read(ref nativeTrampolineMisses)} / 例外: {Interlocked.Read(ref nativeTrampolineFailures)}");
                 ImGui.Text($"通常HB実行要求: {Interlocked.Read(ref executeIsolationCalls)} / 分離経路: {Interlocked.Read(ref executeIsolationScopedAdjustments)} / 未接続: {Interlocked.Read(ref executeIsolationScopeMisses)} / 例外: {Interlocked.Read(ref executeIsolationFailures)}");
                 var lastSuccess = Volatile.Read(ref wrathOriginalLastSuccessTick);
@@ -4922,6 +5146,7 @@ public sealed unsafe partial class Plugin : IDalamudPlugin
         try { executeSlotHook?.Dispose(); } catch { }
         try { adjustedActionHook?.Dispose(); } catch { }
         try { iconRenderHook?.Dispose(); } catch { }
+        try { slotAppearanceHook?.Dispose(); } catch { }
         clickView.Dispose();
         clickMap.Dispose();
         overlayView.Dispose();

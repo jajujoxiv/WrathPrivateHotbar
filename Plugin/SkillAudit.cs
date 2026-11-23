@@ -231,8 +231,19 @@ public sealed unsafe partial class Plugin
                 for (var slot = 0; slot < 12; slot++)
                 {
                     var nativeSlot = module->GetSlotById((uint)(hb - 1), (uint)slot);
-                    if (nativeSlot == null || nativeSlot->CommandType !=
-                        RaptureHotbarModule.HotbarSlotType.Action || nativeSlot->CommandId == 0)
+                    if (nativeSlot == null || nativeSlot->CommandId == 0)
+                        continue;
+                    // Sprint is saved as GeneralAction ID 4 on some hotbars,
+                    // while the usage observer reports regular Action ID 3.
+                    // Normalize this specific pair; never equate all general
+                    // actions with Action rows.
+                    if (IsSprintSlot(nativeSlot->CommandType, nativeSlot->CommandId))
+                    {
+                        auditScannedSlots++;
+                        auditStoredActionIds.Add(3u);
+                        continue;
+                    }
+                    if (nativeSlot->CommandType != RaptureHotbarModule.HotbarSlotType.Action)
                         continue;
                     auditScannedSlots++;
                     var stored = nativeSlot->CommandId;
@@ -423,7 +434,7 @@ public sealed unsafe partial class Plugin
     {
         if (!ImGui.CollapsingHeader("4. 未登録スキルチェッカー（テスト機能）")) return;
         ImGui.TextWrapped("使用されたスキルを記録し、WrathCombo用HB以外の標準ホットバー1～10に登録されているかチェックします。");
-        ImGui.TextDisabled("判定エンジン v2.0.5.100 ／ 全ジョブのFF14標準変化IDを継続学習（試験機能）");
+        ImGui.TextDisabled("判定エンジン v2.0.5.102 ／ 全ジョブのFF14標準変化IDを継続学習（試験機能）");
         ImGui.TextDisabled($"WrathCombo用HB{config.SelectedHotbar}を自動除外 ／ 他の9本を確認（非表示HBも対象）");
         AuditEnsureNonSlotIdIndex();
         ImGui.TextDisabled($"ジョブ別ID索引: {auditNonSlotIdIndexStatus}");
@@ -442,7 +453,7 @@ public sealed unsafe partial class Plugin
         ImGui.TextDisabled("ログイン中は自動監視します。結果はメモリにのみ保存され、プラグイン再起動で消えます。");
         RefreshSkillAuditSnapshot();
         ImGui.TextDisabled(auditSnapshotReady
-            ? $"登録照合：HB{config.SelectedHotbar}以外の{auditCheckedBars}本／登録済Action枠{auditScannedSlots}個"
+            ? $"登録照合：HB{config.SelectedHotbar}以外の{auditCheckedBars}本／登録済Action枠（Sprint含む）{auditScannedSlots}個"
             : "登録照合：ログインとHUD準備待ち");
         uint job = 0;
         try { if (playerState.IsLoaded) job = playerState.ClassJob.RowId; }
