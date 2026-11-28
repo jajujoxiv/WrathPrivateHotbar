@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Plugin/Core/OnBar.cs" Link="OnBar.cs" />
+    <Compile Include="../../Plugin/Core/Preferences.cs" Link="Preferences.cs" />
+    <Compile Include="../../Plugin/Core/GameBars.cs" Link="GameBars.cs" />
+    <Compile Include="../../Plugin/Core/PulseInput.cs" Link="PulseInput.cs" />
+    <Compile Include="../../Plugin/Core/NativeRouter.cs" Link="NativeRouter.cs" />
+  </ItemGroup>
+</Project>

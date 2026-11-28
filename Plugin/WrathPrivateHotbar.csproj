@@ -1,17 +1,34 @@
-﻿<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
-    <Version>2.0.5.105</Version>
+    <Version>2.0.10.0</Version>
+    <AssemblyVersion>2.0.10.0</AssemblyVersion>
+    <FileVersion>2.0.10.0</FileVersion>
+    <InformationalVersion>2.0.10.0</InformationalVersion>
     <Platforms>x64</Platforms>
-    <AssemblyVersion>2.0.5.105</AssemblyVersion>
-    <FileVersion>2.0.5.105</FileVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=/_/WrathPrivateHotbar</PathMap>
+    <DebugType>embedded</DebugType>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <LangVersion>latest</LangVersion>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <DisableTransitiveFrameworkReferenceDownloads>true</DisableTransitiveFrameworkReferenceDownloads>
+    <DalamudDir Condition="'$(DALAMUD_HOME)' != ''">$(DALAMUD_HOME)</DalamudDir>
+    <DalamudDir Condition="'$(DalamudDir)' == ''">$(AppData)/XIVLauncher/addon/Hooks/dev</DalamudDir>
   </PropertyGroup>
   <ItemGroup>
-    <Content Include="WrathPrivateHotbar.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="Core/**/*.cs" />
+    <None Update="WrathPrivateHotbar.json" CopyToOutputDirectory="PreserveNewest" />
+    <Reference Include="Dalamud;Dalamud.Bindings.ImGui;FFXIVClientStructs;InteropGenerator.Runtime;Lumina;Lumina.Excel;Microsoft.Extensions.ObjectPool;Serilog">
+      <HintPath>$(DalamudDir)/%(Identity).dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
+  <Target Name="CheckDalamud" BeforeTargets="ResolveAssemblyReferences" Condition="!Exists('$(DalamudDir)/Dalamud.dll')">
+    <Error Text="Dalamud API 15 reference files are required. Set DALAMUD_HOME to the folder containing Dalamud.dll." />
+  </Target>
 </Project>

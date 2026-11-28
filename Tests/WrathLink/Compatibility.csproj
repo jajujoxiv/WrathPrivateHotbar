@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>WrathCombo</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <DefineConstants>$(DefineConstants);CLIENT_SCENARIOS</DefineConstants>
+    <DefineConstants Condition="'$(WrathSource)' != ''">$(DefineConstants);UPSTREAM</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Plugin/Core/*.cs" Exclude="../../Plugin/Core/DesktopInput.cs" />
+    <Compile Include="../Routing/Stubs.cs" />
+    <Compile Include="$(WrathSource)" Link="Upstream/ActionReplacer.cs" Condition="'$(WrathSource)' != ''" />
+  </ItemGroup>
+</Project>
